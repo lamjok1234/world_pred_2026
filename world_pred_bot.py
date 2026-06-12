@@ -1,6 +1,6 @@
 """
-Kicktipp Debug Bot — verbose version to diagnose scraping issues
-Run this, then send /leaderboard and paste the terminal output here.
+Kicktipp WorldPrediction2026 — Telegram Bot
+/leaderboard — shows the prediction matrix exactly as on the website
 """
 
 import os
@@ -28,144 +28,200 @@ logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=loggin
 logger = logging.getLogger(__name__)
 
 
-def fetch_and_debug():
-    print("\n" + "="*60)
-    print("STEP 1: Sending HTTP request...")
-    print(f"  URL: {URL}")
+def parse_header_cell(cell):
+    """
+    Parse a header cell like 'MEXRSA2-0' or 'QATCH---' into (label, result).
+    Format: TEAM1(3chars) + TEAM2(2-4chars) + score_or_dashes
+    """
+    m = re.match(r'^([A-Z]+)([\d]+-[\d]+|---)$', cell)
+    if not m:
+        return None, None
+    teams  = m.group(1)
+    result = m.group(2)
+    t1 = teams[:3]
+    t2 = teams[3:]
+    if not t2:
+        return None, None
+    return f"{t1} {t2}", result
 
+
+def split_pred(raw):
+    """
+    Kicktipp concatenates prediction + points earned into one string:
+      '2-09' -> pred='2-0', pts='9'
+      '1-03' -> pred='1-0', pts='3'
+      '2-19' -> pred='2-1', pts='9'
+      '1-1'  -> pred='1-1', pts=''   (match not finished yet)
+      '---'  -> pred='---', pts=''
+      ''     -> pred='-',   pts=''
+    Rule: away score is always exactly 1 digit; extra digits are points.
+    """
+    raw = raw.strip()
+    if not raw or raw == "---":
+        return raw or "-", ""
+    m = re.match(r'^(\d+)-(\d+)$', raw)
+    if m:
+        home     = m.group(1)
+        away_pts = m.group(2)
+        if len(away_pts) > 1:
+            return f"{home}-{away_pts[0]}", away_pts[1:]
+        return f"{home}-{away_pts}", ""
+    return raw, ""
+
+
+def pred_emoji(result, pred):
+    if not result or result == "---" or not pred or pred in ("-", "---"):
+        return ""
+    try:
+        rh, ra = map(int, result.split("-"))
+        ph, pa = map(int, pred.split("-"))
+        if rh == ph and ra == pa:
+            return "✅"
+        if (rh > ra and ph > pa) or (rh < ra and ph < pa) or (rh == ra and ph == pa):
+            return "🎯"
+        return "❌"
+    except Exception:
+        return ""
+
+
+def fetch_matrix():
     r = requests.get(URL, headers=HEADERS, timeout=15)
-
-    print(f"  Status code:     {r.status_code}")
-    print(f"  Response length: {len(r.text)} chars")
-    print(f"  Content-Type:    {r.headers.get('Content-Type','?')}")
-
-    print("\nSTEP 2: Raw HTML (first 600 chars):")
-    print("-"*40)
-    print(r.text[:600])
-    print("-"*40)
-
-    print("\nSTEP 3: Parsing with BeautifulSoup...")
+    r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
-    tables = soup.find_all("table")
-    print(f"  Tables found: {len(tables)}")
-
-    for i, table in enumerate(tables):
-        rows = table.find_all("tr")
-        print(f"\n  Table[{i}]: {len(rows)} rows")
-        for j, row in enumerate(rows[:5]):
-            cells = [c.get_text(strip=True) for c in row.find_all(["th", "td"])]
-            print(f"    Row[{j}]: {cells}")
-
-    print("\nSTEP 4: Looking for match header pattern (e.g. 'MEX RSA 0-0')...")
     match_labels  = []
     match_results = []
-    found_in_table = -1
+    players = []
 
-    for i, table in enumerate(tables):
+    for table in soup.find_all("table"):
         rows = table.find_all("tr")
+        if not rows:
+            continue
+
+        # Find the header row: contains cells matching TEAM1TEAM2score pattern
+        header_row  = None
+        num_matches = 0
+
         for row in rows:
             cells = [c.get_text(strip=True) for c in row.find_all(["th", "td"])]
-            cols = []
+            labels, results = [], []
             for cell in cells:
-                m = re.match(r'^([A-Z]{2,4})\s+([A-Z]{2,4})\s+([\d]+-[\d]+|---)$', cell)
-                if m:
-                    cols.append(m)
-            if cols:
-                print(f"  ✅ Found match headers in Table[{i}]:")
-                for m in cols:
-                    label  = f"{m.group(1)} {m.group(2)}"
-                    result = m.group(3)
-                    match_labels.append(label)
-                    match_results.append(result)
-                    print(f"     {label} → {result}")
-                found_in_table = i
+                label, result = parse_header_cell(cell)
+                if label:
+                    labels.append(label)
+                    results.append(result)
+            if labels:
+                match_labels  = labels
+                match_results = results
+                num_matches   = len(labels)
+                header_row    = row
                 break
-        if found_in_table >= 0:
+
+        if not header_row:
+            continue
+
+        # Parse player rows
+        for row in rows:
+            if row is header_row:
+                continue
+            cells = [c.get_text(strip=True) for c in row.find_all("td")]
+            if len(cells) < 4:
+                continue
+            pos = cells[0].replace(".", "").strip()
+            if not pos.isdigit():
+                continue
+            name = cells[2].strip()
+            if not name:
+                continue
+
+            preds = []
+            pts_list = []
+            for i in range(num_matches):
+                col = 3 + i
+                raw = cells[col] if col < len(cells) else ""
+                pred, pts = split_pred(raw)
+                preds.append(pred)
+                pts_list.append(pts)
+
+            md_pts = cells[-4].strip() if len(cells) >= 4 else "0"
+            total  = cells[-1].strip() if cells             else "0"
+
+            players.append({
+                "pos":    int(pos),
+                "name":   name,
+                "preds":  preds,
+                "pts":    pts_list,
+                "md_pts": md_pts or "0",
+                "total":  total  or "0",
+            })
+
+        if players:
             break
-
-    if found_in_table < 0:
-        print("  ❌ No match headers found in any table!")
-        print("\nSTEP 5: All cell texts across all tables:")
-        for i, table in enumerate(tables):
-            print(f"\n  Table[{i}] all cells:")
-            for row in table.find_all("tr"):
-                cells = [c.get_text(strip=True) for c in row.find_all(["th","td"])]
-                if any(cells):
-                    print(f"    {cells}")
-        return [], [], []
-
-    print(f"\nSTEP 5: Parsing player rows from Table[{found_in_table}]...")
-    players = []
-    table = tables[found_in_table]
-    rows  = table.find_all("tr")
-    num_matches = len(match_labels)
-
-    for row in rows:
-        cells = [c.get_text(strip=True) for c in row.find_all("td")]
-        if len(cells) < 4:
-            continue
-        pos = cells[0].replace(".", "").strip()
-        if not pos.isdigit():
-            continue
-        name = cells[2].strip()
-        if not name:
-            continue
-
-        preds = []
-        for i in range(num_matches):
-            col = 3 + i
-            raw = cells[col] if col < len(cells) else ""
-            preds.append(raw.strip() or "-")
-
-        pts   = cells[-4].strip() if len(cells) >= 4 else "0"
-        total = cells[-1].strip() if cells             else "0"
-
-        player = {"pos": int(pos), "name": name, "preds": preds, "pts": pts or "0", "total": total or "0"}
-        players.append(player)
-        print(f"  Player: {name:15} preds={preds}  pts={pts}  total={total}")
-
-    print(f"\n  Total players found: {len(players)}")
-    print("="*60 + "\n")
 
     return match_labels, match_results, players
 
 
-async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Running debug fetch... check your terminal for full output.")
-    try:
-        match_labels, match_results, players = fetch_and_debug()
-        if not match_labels:
-            await update.message.reply_text(
-                "❌ No match data found.\n\n"
-                "Check terminal output and send it to Claude."
-            )
-        elif not players:
-            await update.message.reply_text(
-                f"⚠️ Found {len(match_labels)} matches but 0 players.\n\n"
-                f"Matches: {match_labels}\n\nCheck terminal output."
-            )
-        else:
-            summary = (
-                f"✅ Scraping worked!\n\n"
-                f"Matches: {len(match_labels)}\n"
-                f"Players: {len(players)}\n\n"
-                f"Sample — {players[0]['name']}: {players[0]['preds']}\n\n"
-                f"Paste your terminal output to Claude to fix the bot."
-            )
-            await update.message.reply_text(summary)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Exception: {e}")
-        print(f"EXCEPTION: {e}")
-        import traceback
-        traceback.print_exc()
+def build_table(match_labels, match_results, players):
+    if not match_labels or not players:
+        return "⚠️ No data found. Try again later."
+
+    name_w = max(len(p["name"]) for p in players)
+    name_w = max(name_w, 5)
+    col_w  = 5
+
+    # Short 3-letter col headers
+    short = [lbl.split()[0] for lbl in match_labels]
+
+    def make_row(name_col, pred_cols, pts_col, tot_col):
+        return (
+            name_col.ljust(name_w) + "  " +
+            "  ".join(c.center(col_w) for c in pred_cols) +
+            f"  {pts_col:>3}  {tot_col:>3}"
+        )
+
+    header   = make_row("Name",  short,         " P ", " T ")
+    score_r  = make_row("Score", match_results, "   ", "   ")
+    divider  = "-" * len(header)
+
+    lines = ["🏆 *WorldPrediction2026*\n", "```"]
+    lines.append(header)
+    lines.append(score_r)
+    lines.append(divider)
+
+    for p in players:
+        preds = [p["preds"][i] if i < len(p["preds"]) else "-" for i in range(len(match_labels))]
+        lines.append(make_row(p["name"], preds, p["md_pts"], p["total"]))
+
+    lines.append("```")
+    lines.append("_\\- = no prediction yet_")
+    return "\n".join(lines)
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔍 *Debug Bot*\n\nSend /debug — it will fetch the Kicktipp page and print everything to the terminal.\n\nThen paste the terminal output to Claude.",
+        "👋 *WorldPrediction2026 Bot*\n\nUse /leaderboard to see the prediction matrix.\n\nType /help for all commands.",
         parse_mode="Markdown"
     )
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *Commands*\n\n"
+        "/leaderboard — Full prediction matrix showing everyone's tips for each match, the actual score, and current points\n\n"
+        "/start — Welcome message\n\n"
+        "/help — This message",
+        parse_mode="Markdown"
+    )
+
+async def cmd_leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Fetching…")
+    try:
+        match_labels, match_results, players = fetch_matrix()
+        text = build_table(match_labels, match_results, players)
+    except Exception as e:
+        logger.error(e)
+        text = f"❌ Error: {e}"
+    for chunk in [text[i:i+4096] for i in range(0, len(text), 4096)]:
+        await update.message.reply_text(chunk, parse_mode="Markdown")
 
 
 def main():
@@ -173,12 +229,11 @@ def main():
         print("⚠️  Set TELEGRAM_BOT_TOKEN env var or paste your token into BOT_TOKEN.")
         return
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("debug", cmd_debug))
-    app.add_handler(CommandHandler("leaderboard", cmd_debug))  # both commands do debug
-    print("🔍 Debug bot running. Send /debug in Telegram, then paste terminal output to Claude.")
+    app.add_handler(CommandHandler("start",       cmd_start))
+    app.add_handler(CommandHandler("help",        cmd_help))
+    app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
+    logger.info("Bot is running…")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
