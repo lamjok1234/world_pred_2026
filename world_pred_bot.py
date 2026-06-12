@@ -168,7 +168,8 @@ def build_table(match_labels, match_results, players):
     name_w = 8   # truncate names to 8 chars
     col_w  = 3   # "2-0" and "---" are both 3 chars
 
-    short = [lbl.split()[0][:3] for lbl in match_labels]  # MEX, KOR, ...
+    home_teams = [lbl.split()[0][:3] for lbl in match_labels]
+    away_teams = [lbl.split()[1][:3] if len(lbl.split()) > 1 else "   " for lbl in match_labels]
 
     def make_row(name_col, pred_cols, pts_col, tot_col):
         return (
@@ -177,12 +178,14 @@ def build_table(match_labels, match_results, players):
             f" {pts_col:>2} {tot_col:>2}"
         )
 
-    header  = make_row("Name",  short,         "P", "T")
+    header1 = make_row("",      home_teams,    " ", " ")
+    header2 = make_row("",      away_teams,    "P", "T")
     score_r = make_row("Score", match_results, " ", " ")
-    divider = "-" * len(header)
+    divider = "-" * len(header1)
 
     lines = ["🏆 *WorldPrediction2026*\n", "```"]
-    lines.append(header)
+    lines.append(header1)
+    lines.append(header2)
     lines.append(score_r)
     lines.append(divider)
 
