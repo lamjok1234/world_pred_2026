@@ -1,6 +1,7 @@
 """
 Kicktipp WorldPrediction2026 — Telegram Bot
 /leaderboard — shows the prediction matrix exactly as on the website
+/bonus       — shows the bonus prediction matrix
 """
 
 import os
@@ -13,6 +14,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 URL = "https://www.kicktipp.com/worldprediction2026/leaderboard"
+BONUS_URL = "https://www.kicktipp.com/worldprediction2026/leaderboard?bonus=true"
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -84,8 +86,8 @@ def pred_emoji(result, pred):
         return ""
 
 
-def fetch_matrix():
-    r = requests.get(URL, headers=HEADERS, timeout=15)
+def fetch_matrix(url=URL):
+    r = requests.get(url, headers=HEADERS, timeout=15)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -159,7 +161,7 @@ def fetch_matrix():
     return match_labels, match_results, players
 
 
-def build_table(match_labels, match_results, players):
+def build_table(match_labels, match_results, players, title="🏆 *WorldPrediction2026*"):
     if not match_labels or not players:
         return "⚠️ No data found. Try again later."
 
@@ -181,7 +183,7 @@ def build_table(match_labels, match_results, players):
     score_r = make_row("Score", match_results, " ")
     divider = "-" * len(header1)
 
-    lines = ["🏆 *WorldPrediction2026*\n", "```"]
+    lines = [f"{title}\n", "```"]
     lines.append(header1)
     lines.append(header2)
     lines.append(score_r)
@@ -198,7 +200,7 @@ def build_table(match_labels, match_results, players):
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 *WorldPrediction2026 Bot*\n\nUse /leaderboard to see the prediction matrix.\n\nType /help for all commands.",
+        "👋 *WorldPrediction2026 Bot*\n\nUse /leaderboard to see the prediction matrix.\nUse /bonus to see the bonus predictions.\n\nType /help for all commands.",
         parse_mode="Markdown"
     )
 
@@ -206,6 +208,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *Commands*\n\n"
         "/leaderboard — Full prediction matrix showing everyone's tips for each match, the actual score, and current points\n\n"
+        "/bonus — Bonus predictions matrix\n\n"
         "/start — Welcome message\n\n"
         "/help — This message",
         parse_mode="Markdown"
@@ -222,6 +225,17 @@ async def cmd_leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for chunk in [text[i:i+4096] for i in range(0, len(text), 4096)]:
         await update.message.reply_text(chunk, parse_mode="Markdown")
 
+async def cmd_bonus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Fetching bonus predictions…")
+    try:
+        match_labels, match_results, players = fetch_matrix(url=BONUS_URL)
+        text = build_table(match_labels, match_results, players, title="🎁 *Bonus Predictions*")
+    except Exception as e:
+        logger.error(e)
+        text = f"❌ Error: {e}"
+    for chunk in [text[i:i+4096] for i in range(0, len(text), 4096)]:
+        await update.message.reply_text(chunk, parse_mode="Markdown")
+
 
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
@@ -231,6 +245,7 @@ def main():
     app.add_handler(CommandHandler("start",       cmd_start))
     app.add_handler(CommandHandler("help",        cmd_help))
     app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
+    app.add_handler(CommandHandler("bonus",       cmd_bonus))
     logger.info("Bot is running…")
     app.run_polling()
 
