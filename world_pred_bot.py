@@ -311,10 +311,13 @@ def fetch_bonus_matrix():
             ci += span
 
         tr = p["total_raw"]
-        if tr and tr.replace(",", ".").lstrip("-").isdigit():
-            p["total"] = tr
+        # Clean the total_raw of non-digit artifacts to prevent ValueError crashes
+        clean_tr = re.sub(r'[^\d-]', '', tr)
+        if clean_tr and clean_tr.lstrip("-").isdigit():
+            p["total"] = clean_tr
         else:
-            p["total"] = str(sum(int(pt) for pt in pts_list if pt.isdigit()))
+            # Fallback calculation if there are no explicit totals
+            p["total"] = str(sum(int(pt) for pt in pts_list if pt and pt.isdigit()))
             
         p["answers"] = answers
         p["pts"] = pts_list
@@ -351,7 +354,7 @@ def build_bonus_image(question_texts, correct_answers, players):
     # 2. Plot with Matplotlib
     num_rows, num_cols = df.shape
     
-    # Make the physical figure size large so text isn't squished
+    # Control figure size manually.
     fig_width = max(16, num_cols * 3.5)  
     fig_height = max(6, num_rows * 0.8) 
     
@@ -378,11 +381,14 @@ def build_bonus_image(question_texts, correct_answers, players):
         else:  # Player rows
             cell.set_facecolor('#F9F9F9' if row % 2 == 0 else '#FFFFFF')
 
+    # Enforce margins directly to avoid automatic bbox_inches='tight' resizing
+    # which frequently causes Telegram's 10000x10000px limit crash.
+    plt.subplots_adjust(left=0.02, right=0.98, top=0.95, bottom=0.05)
+    
     buf = BytesIO()
     
-    # MUST use bbox_inches='tight' for tables to avoid 0x0 dimensions (invalid_dimensions error)
-    # dpi=200 gives crisp text without exceeding Telegram's 10MB/10000px limits
-    plt.savefig(buf, format="PNG", dpi=200, bbox_inches='tight', facecolor='white')
+    # Cap DPI at 150. Higher values risk exceeding the Telegram dimension max.
+    plt.savefig(buf, format="PNG", dpi=150, facecolor='white')
     plt.close(fig)
     buf.seek(0)
     
