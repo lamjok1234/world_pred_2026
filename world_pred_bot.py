@@ -1,7 +1,7 @@
 """
 Kicktipp WorldPrediction2026 — Telegram Bot
 /leaderboard — shows the prediction matrix exactly as on the website
-/bonus       — shows the bonus questions (one message per question)
+/bonus       — shows the bonus questions in a horizontally scrollable table
 """
 
 import os
@@ -156,12 +156,10 @@ def fetch_bonus_matrix():
     soup = BeautifulSoup(r.text, "html.parser")
     all_tables = soup.find_all("table")
 
-    # ------------------------------------------------------------------
-    # Step 1 — Upper table: extract full question texts + correct answers
-    # ------------------------------------------------------------------
     question_texts = []
     correct_answers_upper = []
 
+    # Step 1: Upper table (real question texts)
     for table in all_tables:
         for row in table.find_all("tr"):
             cells = [c.get_text(strip=True) for c in row.find_all(["th", "td"])]
@@ -171,19 +169,15 @@ def fetch_bonus_matrix():
             if not first.isdigit():
                 continue
             q = cells[1].strip()
-            # Real questions are longer than the short IDs in the matrix header
             if len(q) > 10 and not re.match(r'^[A-Z]{2,}[\d\-]+$', q):
                 question_texts.append(q)
                 ca = cells[2].strip()
                 correct_answers_upper.append(ca if ca not in ("-", "---", "") else "")
 
-    # ------------------------------------------------------------------
-    # Step 2 — Lower matrix table: per-player raw cell values
-    # ------------------------------------------------------------------
+    # Step 2: Lower matrix table
     matrix_labels = []
     correct_from_matrix = []
     players = []
-
     TOTAL_KEYWORDS = {"pkt", "punkte", "total", "sum", "t", "pts", "p"}
 
     for table in all_tables:
@@ -202,7 +196,6 @@ def fetch_bonus_matrix():
             if any(re.match(r'^[A-Z]+(\d+-\d+|---)$', l) for l in labels):
                 continue
 
-            # Strip trailing total-column header (e.g. "Pkt.", "T", empty)
             clean = list(labels)
             while clean:
                 last = clean[-1].strip().lower().rstrip(".")
@@ -223,7 +216,6 @@ def fetch_bonus_matrix():
 
         remaining = [r for r in rows if r is not header_row]
 
-        # Correct-answer row (first non-player row after header)
         if remaining:
             fc = [c.get_text(strip=True) for c in remaining[0].find_all(["th", "td"])]
             fp = fc[0].replace(".", "").strip() if fc else ""
@@ -248,37 +240,29 @@ def fetch_bonus_matrix():
         if players:
             break
 
-    # ------------------------------------------------------------------
-    # Step 3 — Map questions → matrix columns (handle multi-col last Q)
-    # ------------------------------------------------------------------
+    # Step 3: Map questions to matrix cols & handle multi-col last question
     num_q = len(question_texts)
     num_c = len(matrix_labels)
 
-    # Fallback: no upper table found → use matrix labels as-is
     if num_q == 0:
         question_texts = list(matrix_labels)
         num_q = num_c
 
-    # Safety: can't have more questions than columns
     if num_c < num_q:
         question_texts = question_texts[:num_c]
         correct_answers_upper = correct_answers_upper[:num_c]
         num_q = num_c
 
-    # How many matrix columns does the LAST question span?
-    # e.g. 6 questions, 9 columns → last question = 4 columns (semifinal)
     last_q_span = max(1, num_c - num_q + 1)
 
-    # ---- correct answers (prefer upper table) ----
+    # Correct answers
     correct_answers = []
     ci = 0
     for qi in range(num_q):
         span = last_q_span if (qi == num_q - 1 and last_q_span > 1) else 1
-        # Prefer upper-table answer
         if qi < len(correct_answers_upper) and correct_answers_upper[qi]:
             correct_answers.append(correct_answers_upper[qi])
         else:
-            # Fallback: concatenate from matrix correct-answer row
             parts = []
             for j in range(span):
                 if ci + j < len(correct_from_matrix):
@@ -288,7 +272,7 @@ def fetch_bonus_matrix():
             correct_answers.append(",".join(parts))
         ci += span
 
-    # ---- per-player answers ----
+    # Player answers
     for p in players:
         answers, pts_list = [], []
         ci = 0
@@ -315,12 +299,12 @@ def fetch_bonus_matrix():
                     pts_list.append("")
             ci += span
 
-        # Total: use matrix value if numeric, else compute from pts
         tr = p["total_raw"]
         if tr and tr.replace(",", ".").lstrip("-").isdigit():
             p["total"] = tr
         else:
             p["total"] = str(sum(int(pt) for pt in pts_list if pt.isdigit()))
+            
         p["answers"] = answers
         p["pts"] = pts_list
         del p["raw"], p["total_raw"]
@@ -328,45 +312,50 @@ def fetch_bonus_matrix():
     return question_texts, correct_answers, players
 
 
-def build_bonus_messages(bonus_labels, correct_answers, players):
-    if not bonus_labels or not players:
-        return ["⚠️ No bonus data found. Try again later."]
+def build_bonus_table(question_texts, correct_answers, players):
+    if not question_texts or not players:
+        return "⚠️ No bonus data found. Try again later."
 
-    messages = []
-
-    for idx, label in enumerate(bonus_labels):
-        correct = correct_answers[idx] if idx < len(correct_answers) else ""
-
-        lines = [f"📌 *{label}*"]
-        if correct:
-            lines.append(f"✅ Answer: {correct}")
-        lines.append("")
-
+    name_w = 7
+    num_q = len(question_texts)
+    
+    # Dynamically calculate width per question column (max 15 chars)
+    col_widths = []
+    for i in range(num_q):
+        max_len = len(question_texts[i][:15])
+        if i < len(correct_answers):
+            max_len = max(max_len, len(correct_answers[i][:15]))
         for p in players:
-            answer = p["answers"][idx] if idx < len(p["answers"]) else "-"
-            pts = p["pts"][idx] if idx < len(p["pts"]) else ""
+            ans = p["answers"][i] if i < len(p["answers"]) else "-"
+            max_len = max(max_len, len(str(ans)[:15]))
+        col_widths.append(max(max_len, 3)) # Minimum width of 3
 
-            if correct and answer not in ("-", "---"):
-                if pts and int(pts) > 0:
-                    status = f"✅ {pts}pts"
-                elif pts == "0":
-                    status = "❌ 0pts"
-                else:
-                    status = "·"
-            else:
-                status = "·"
+    def row(name, cols, tot):
+        parts = [name[:name_w].ljust(name_w)]
+        for i, c in enumerate(cols):
+            parts.append(str(c)[:col_widths[i]].ljust(col_widths[i]))
+        parts.append(f"{tot:>3}")
+        return " ".join(parts)
 
-            lines.append(f"{p['pos']}. {p['name']} — {answer} {status}")
+    lines = ["🏆 *WorldPrediction2026 — Bonus*\n", "```"]
+    
+    # Row 1: Question texts
+    lines.append(row("Q", question_texts, "T"))
+    
+    # Row 2: Correct answers
+    ca_row = ["-" if not (i < len(correct_answers) and correct_answers[i]) else correct_answers[i] for i in range(num_q)]
+    lines.append(row("Ans", ca_row, " "))
+    
+    # Divider
+    lines.append("-" * len(row("Q", question_texts, "T")))
 
-        messages.append("\n".join(lines))
-
-    # Totals summary
-    sum_lines = ["📊 *Bonus Totals*", ""]
+    # Player rows
     for p in players:
-        sum_lines.append(f"{p['pos']}. {p['name']} — {p['total']}pts")
-    messages.append("\n".join(sum_lines))
+        lines.append(row(p["name"], p["answers"], p["total"]))
 
-    return messages
+    lines.append("```")
+    lines.append("_\\- = no answer yet · T = total bonus pts_")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -388,8 +377,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📖 *Commands*\n\n"
         "/leaderboard — Full prediction matrix showing everyone's tips "
         "for each match, the actual score, and current points\n\n"
-        "/bonus — Bonus questions: one message per question showing "
-        "all players' answers and points earned\n\n"
+        "/bonus — Bonus questions matrix (swipe left to scroll)\n\n"
         "/start — Welcome message\n\n"
         "/help — This message",
         parse_mode="Markdown",
@@ -412,13 +400,12 @@ async def cmd_bonus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Fetching bonus…")
     try:
         bonus_labels, correct_answers, players = fetch_bonus_matrix()
-        messages = build_bonus_messages(bonus_labels, correct_answers, players)
+        text = build_bonus_table(bonus_labels, correct_answers, players)
     except Exception as e:
         logger.error(e)
-        messages = [f"❌ Error: {e}"]
-    for msg in messages:
-        for chunk in [msg[i:i + 4096] for i in range(0, len(msg), 4096)]:
-            await update.message.reply_text(chunk, parse_mode="Markdown")
+        text = f"❌ Error: {e}"
+    for chunk in [text[i:i + 4096] for i in range(0, len(text), 4096)]:
+        await update.message.reply_text(chunk, parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
