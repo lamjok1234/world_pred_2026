@@ -1,18 +1,13 @@
 """
 Kicktipp WorldPrediction2026 — Telegram Bot
 /leaderboard — shows the prediction matrix exactly as on the website
-/bonus       — shows the bonus questions as a high-res, zoomable IMAGE
+/bonus       — shows the bonus questions as a clean text matrix
 """
 
 import os
 import re
 import logging
 import requests
-import pandas as pd
-import matplotlib
-matplotlib.use('Agg') # Required for servers without a screen/GUI
-import matplotlib.pyplot as plt
-from io import BytesIO
 from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -59,18 +54,6 @@ def split_pred(raw):
         if len(away_pts) > 1:
             return f"{home}-{away_pts[0]}", away_pts[1:]
         return f"{home}-{away_pts}", ""
-    return raw, ""
-
-
-def split_bonus(raw):
-    raw = raw.strip()
-    if not raw or raw in ("---", "-"):
-        return raw or "-", ""
-    if raw.isdigit():
-        return raw, ""
-    m = re.match(r'^(.+?)(\d{1,2})$', raw)
-    if m and not m.group(1).isdigit():
-        return m.group(1), m.group(2)
     return raw, ""
 
 
@@ -158,245 +141,131 @@ def build_table(match_labels, match_results, players):
 
 
 # ---------------------------------------------------------------------------
-# /bonus
+# /bonus  (NEW: Pure Text-Based Matrix)
 # ---------------------------------------------------------------------------
 
 def fetch_bonus_matrix():
     r = requests.get(URL + "?bonus=true", headers=HEADERS, timeout=15)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-    all_tables = soup.find_all("table")
+    
+    # Target the specific ranking table by ID
+    table = soup.find("table", {"id": "ranking"})
+    if not table:
+        return [], [], []
 
-    question_texts = []
-    correct_answers_upper = []
+    header_row = table.find("thead").find("tr")
+    if not header_row:
+        return [], [], []
 
-    # Step 1: Upper table (real question texts)
-    for table in all_tables:
-        for row in table.find_all("tr"):
-            cells = [c.get_text(strip=True) for c in row.find_all(["th", "td"])]
-            if len(cells) < 3:
-                continue
-            first = cells[0].replace(".", "").strip()
-            if not first.isdigit():
-                continue
-            q = cells[1].strip()
-            if len(q) > 10 and not re.match(r'^[A-Z]{2,}[\d\-]+$', q):
-                question_texts.append(q)
-                ca = cells[2].strip()
-                correct_answers_upper.append(ca if ca not in ("-", "---", "") else "")
+    # 1. Extract exact short labels (WC, Tor, Gr A, SF...) from HTML
+    # We ignore the hidden SF duplicates by checking if 'display: none' is in the style
+    labels = []
+    for th in header_row.find_all("th", class_="ereignis"):
+        kurz = th.find("div", class_="kurzfrage")
+        if kurz and "display: none" not in (kurz.get("style", "")):
+            labels.append(kurz.get_text(strip=True))
 
-    # Step 2: Lower matrix table
-    matrix_labels = []
-    correct_from_matrix = []
+    # 2. Extract players cleanly using exact HTML classes and data attributes
     players = []
-    TOTAL_KEYWORDS = {"pkt", "punkte", "total", "sum", "t", "pts", "p"}
-
-    for table in all_tables:
-        rows = table.find_all("tr")
-        if not rows:
+    for tr in table.find("tbody").find_all("tr", class_="teilnehmer"):
+        pos_el = tr.find("td", class_="position")
+        name_el = tr.find("div", class_="mg_name")
+        if not pos_el or not name_el:
             continue
-        header_row, num_cols = None, 0
-
-        for row in rows:
-            cells = [c.get_text(strip=True) for c in row.find_all(["th", "td"])]
-            if len(cells) < 5:
-                continue
-            labels = cells[3:]
-            if not any(l.strip() for l in labels):
-                continue
-            if any(re.match(r'^[A-Z]+(\d+-\d+|---)$', l) for l in labels):
-                continue
-
-            clean = list(labels)
-            while clean:
-                last = clean[-1].strip().lower().rstrip(".")
-                if not clean[-1].strip() or last in TOTAL_KEYWORDS:
-                    clean.pop()
-                else:
-                    break
-            if not clean:
-                continue
-
-            matrix_labels = clean
-            num_cols = len(clean)
-            header_row = row
-            break
-
-        if not header_row:
-            continue
-
-        remaining = [r for r in rows if r is not header_row]
-
-        if remaining:
-            fc = [c.get_text(strip=True) for c in remaining[0].find_all(["th", "td"])]
-            fp = fc[0].replace(".", "").strip() if fc else ""
-            if not fp.isdigit() and len(fc) >= 4:
-                correct_from_matrix = fc[3:3 + num_cols]
-                remaining = remaining[1:]
-
-        for row in remaining:
-            cells = [c.get_text(strip=True) for c in row.find_all("td")]
-            if len(cells) < 4:
-                continue
-            pos = cells[0].replace(".", "").strip()
-            if not pos.isdigit():
-                continue
-            name = cells[2].strip()
-            if not name:
-                continue
-            raw = [cells[3 + i].strip() if 3 + i < len(cells) else "" for i in range(num_cols)]
-            total_raw = cells[3 + num_cols].strip() if 3 + num_cols < len(cells) else ""
-            players.append({"pos": int(pos), "name": name, "raw": raw, "total_raw": total_raw})
-
-        if players:
-            break
-
-    # Step 3: Map questions to matrix cols & handle multi-col last question
-    num_q = len(question_texts)
-    num_c = len(matrix_labels)
-
-    if num_q == 0:
-        question_texts = list(matrix_labels)
-        num_q = num_c
-
-    if num_c < num_q:
-        question_texts = question_texts[:num_c]
-        correct_answers_upper = correct_answers_upper[:num_c]
-        num_q = num_c
-
-    last_q_span = max(1, num_c - num_q + 1)
-
-    # Correct answers
-    correct_answers = []
-    ci = 0
-    for qi in range(num_q):
-        span = last_q_span if (qi == num_q - 1 and last_q_span > 1) else 1
-        if qi < len(correct_answers_upper) and correct_answers_upper[qi]:
-            correct_answers.append(correct_answers_upper[qi])
-        else:
-            parts = []
-            for j in range(span):
-                if ci + j < len(correct_from_matrix):
-                    v = correct_from_matrix[ci + j]
-                    if v and v not in ("-", "---"):
-                        parts.append(v)
-            correct_answers.append(",".join(parts))
-        ci += span
-
-    # Player answers
-    for p in players:
-        answers, pts_list = [], []
-        ci = 0
-        for qi in range(num_q):
-            span = last_q_span if (qi == num_q - 1 and last_q_span > 1) else 1
-            if span > 1:
-                parts, pts = [], ""
-                for j in range(span):
-                    if ci + j < len(p["raw"]):
-                        a, pt = split_bonus(p["raw"][ci + j])
-                        if a not in ("-", "---"):
-                            parts.append(a)
-                        if pt and pt.isdigit():
-                            pts = pt
-                answers.append(",".join(parts) if parts else "-")
-                pts_list.append(pts)
-            else:
-                if ci < len(p["raw"]):
-                    a, pt = split_bonus(p["raw"][ci])
-                    answers.append(a)
-                    pts_list.append(pt)
-                else:
-                    answers.append("-")
-                    pts_list.append("")
-            ci += span
-
-        tr = p["total_raw"]
-        # Clean the total_raw of non-digit artifacts to prevent ValueError crashes
-        clean_tr = re.sub(r'[^\d-]', '', tr)
-        if clean_tr and clean_tr.lstrip("-").isdigit():
-            p["total"] = clean_tr
-        else:
-            # Fallback calculation if there are no explicit totals
-            p["total"] = str(sum(int(pt) for pt in pts_list if pt and pt.isdigit()))
             
-        p["answers"] = answers
-        p["pts"] = pts_list
-        del p["raw"], p["total_raw"]
+        pos = pos_el.get_text(strip=True).replace(".", "")
+        name = name_el.get_text(strip=True)
+        if not pos.isdigit():
+            continue
 
-    return question_texts, correct_answers, players
+        answers = []
+        for th in header_row.find_all("th", class_="ereignis"):
+            # Skip columns that were hidden in the header
+            kurz = th.find("div", class_="kurzfrage")
+            if kurz and "display: none" in (kurz.get("style", "")):
+                continue
+                
+            idx = th.get("data-index")
+            cell = tr.find("td", attrs={"data-index": idx})
+            if cell:
+                ans_text = cell.get_text(strip=True)
+                sub_p = cell.find("sub", class_="p")
+                pts_text = sub_p.get_text(strip=True) if sub_p else ""
+                answers.append((ans_text, pts_text))
+            else:
+                answers.append(("-", ""))
+
+        # Extract Total Points (last column 'gesamtpunkte')
+        total_el = tr.find("td", class_="gesamtpunkte")
+        total = total_el.get_text(strip=True) if total_el else "0"
+
+        players.append({
+            "pos": int(pos),
+            "name": name,
+            "answers": answers,
+            "total": total
+        })
+
+    # 3. Extract correct answers from headerboxes
+    correct = []
+    for th in header_row.find_all("th", class_="ereignis"):
+        kurz = th.find("div", class_="kurzfrage")
+        if kurz and "display: none" not in (kurz.get("style", "")):
+            hbox = th.find("div", class_="headerbox")
+            correct.append(hbox.get_text(strip=True) if hbox else "---")
+
+    return labels, correct, players
 
 
-def build_bonus_image(question_texts, correct_answers, players):
-    """Converts parsed bonus data into a HIGH-RESOLUTION PNG image."""
-    if not question_texts or not players:
-        return None
+def build_bonus_text(labels, correct, players):
+    """Builds a fixed-width, highly readable matrix table for Telegram."""
+    if not labels or not players:
+        return "⚠️ No bonus data found. Try again later."
 
-    # 1. Build Data for Pandas
-    data = {}
-    for i, q in enumerate(question_texts):
-        col_data = []
-        # First row is the correct answer
-        ans = correct_answers[i] if i < len(correct_answers) and correct_answers[i] else "-"
-        col_data.append(f"✅ {_truncate(ans, 18)}")
+    name_w = 12
+    col_w = 5
+
+    def format_row(name, cols, total):
+        # Format name column
+        row_str = f"{name:<{name_w}} "
+        # Format each answer column (center aligned)
+        for c in cols:
+            row_str += f"{c:^{col_w}}"
+        # Format total column
+        row_str += f" {total:>{3}}"
+        return row_str
+
+    # Separator line
+    sep_len = name_w + 1 + (col_w * len(labels)) + 4
+    separator = "─" * sep_len
+
+    lines = [
+        "🏆 *WorldPrediction2026 — Bonus Questions*\n",
+        "```",
+        # Correct Answers Row
+        format_row("✅ Answer", correct, ""),
+        # Header Labels Row
+        format_row("Question", labels, "T"),
+        separator
+    ]
+
+    # Player Rows
+    for p in players:
+        display_answers = []
+        for ans, pts in p["answers"]:
+            if pts:       # If they got points, show "ANS 10"
+                display_answers.append(f"{ans[:3]}{pts}")
+            elif ans == "-": # If empty, show dash
+                display_answers.append("-")
+            else:         # If wrong answer, just show the 3-letter code
+                display_answers.append(ans[:3])
         
-        # Player answers
-        for p in players:
-            a = p["answers"][i] if i < len(p["answers"]) else "-"
-            col_data.append(_truncate(a, 18))
-        data[q] = col_data
+        lines.append(format_row(f"{p['pos']}. {p['name']}", display_answers, p["total"]))
 
-    index = ["Answer"] + [f"{p['pos']}. {p['name']}" for p in players]
-    df = pd.DataFrame(data, index=index)
-
-    # Add Total column
-    df["Total"] = [""] + [f"{p['total']} pts" for p in players]
-
-    # 2. Plot with Matplotlib
-    num_rows, num_cols = df.shape
-    
-    # Control figure size manually.
-    fig_width = max(16, num_cols * 3.5)  
-    fig_height = max(6, num_rows * 0.8) 
-    
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-    ax.axis('off')
-
-    # Create table
-    table = ax.table(cellText=df.values, colLabels=df.columns, loc='center', cellLoc='center')
-    
-    # 3. HIGH-RES Styling
-    table.auto_set_font_size(False)
-    table.set_fontsize(14)          
-    table.scale(1, 2.2)             
-
-    for (row, col), cell in table.get_celld().items():
-        cell.set_edgecolor('#CCCCCC')
-        if row == 0:  # Header row (Questions)
-            cell.set_facecolor('#2E7D32') # Dark green
-            cell.set_text_props(weight='bold', color='white')
-            cell.set_height(0.08)
-        elif row == 1:  # Answer row
-            cell.set_facecolor('#E8F5E9') # Light green
-            cell.set_text_props(color='#2E7D32')
-        else:  # Player rows
-            cell.set_facecolor('#F9F9F9' if row % 2 == 0 else '#FFFFFF')
-
-    # Enforce margins directly to avoid automatic bbox_inches='tight' resizing
-    # which frequently causes Telegram's 10000x10000px limit crash.
-    plt.subplots_adjust(left=0.02, right=0.98, top=0.95, bottom=0.05)
-    
-    buf = BytesIO()
-    
-    # Cap DPI at 150. Higher values risk exceeding the Telegram dimension max.
-    plt.savefig(buf, format="PNG", dpi=150, facecolor='white')
-    plt.close(fig)
-    buf.seek(0)
-    
-    # Safety check: make sure buffer actually has image data
-    if buf.getbuffer().nbytes == 0:
-        return None
-        
-    return buf
+    lines.append("```")
+    lines.append("_Points shown if correct (e.g., `GER10`) · T = Total_")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +276,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *WorldPrediction2026 Bot*\n\n"
         "Use /leaderboard to see the prediction matrix.\n"
-        "Use /bonus to see bonus questions as a zoomable image.\n\n"
+        "Use /bonus to see bonus questions as a text matrix.\n\n"
         "Type /help for all commands.",
         parse_mode="Markdown",
     )
@@ -417,7 +286,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *Commands*\n\n"
         "/leaderboard — Full prediction matrix (text)\n\n"
-        "/bonus — Bonus questions matrix sent as a high-res image\n\n"
+        "/bonus — Bonus questions matrix (text)\n\n"
         "/start — Welcome message\n\n"
         "/help — This message",
         parse_mode="Markdown",
@@ -437,20 +306,12 @@ async def cmd_leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_bonus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Fetching bonus & generating image…")
+    await update.message.reply_text("⏳ Fetching bonus matrix…")
     try:
-        bonus_labels, correct_answers, players = fetch_bonus_matrix()
-        image_buffer = build_bonus_image(bonus_labels, correct_answers, players)
-        
-        if image_buffer:
-            await update.message.reply_photo(
-                photo=image_buffer, 
-                caption="🏆 *WorldPrediction2026 — Bonus Questions*", 
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text("⚠️ No bonus data found. Try again later.")
-            
+        labels, correct, players = fetch_bonus_matrix()
+        text = build_bonus_text(labels, correct, players)
+        for chunk in [text[i:i + 4096] for i in range(0, len(text), 4096)]:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
     except Exception as e:
         logger.error(e)
         await update.message.reply_text(f"❌ Error: {e}")
