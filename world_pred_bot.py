@@ -149,7 +149,6 @@ def fetch_bonus_matrix():
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     
-    # Target the specific ranking table by ID
     table = soup.find("table", {"id": "ranking"})
     if not table:
         return [], [], []
@@ -158,15 +157,14 @@ def fetch_bonus_matrix():
     if not header_row:
         return [], [], []
 
-    # 1. Extract exact short labels (WC, Tor, Gr A, SF...) from HTML
-    # We ignore the hidden SF duplicates by checking if 'display: none' is in the style
+    # 1. Extract exact short labels (WC, Tor, Gr A, SF...)
     labels = []
     for th in header_row.find_all("th", class_="ereignis"):
         kurz = th.find("div", class_="kurzfrage")
         if kurz and "display: none" not in (kurz.get("style", "")):
             labels.append(kurz.get_text(strip=True))
 
-    # 2. Extract players cleanly using exact HTML classes and data attributes
+    # 2. Extract players
     players = []
     for tr in table.find("tbody").find_all("tr", class_="teilnehmer"):
         pos_el = tr.find("td", class_="position")
@@ -181,22 +179,25 @@ def fetch_bonus_matrix():
 
         answers = []
         for th in header_row.find_all("th", class_="ereignis"):
-            # Skip columns that were hidden in the header
             kurz = th.find("div", class_="kurzfrage")
             if kurz and "display: none" in (kurz.get("style", "")):
                 continue
                 
             idx = th.get("data-index")
             cell = tr.find("td", attrs={"data-index": idx})
-            if cell:
-                ans_text = cell.get_text(strip=True)
+            
+            if cell and cell.get("data-antwort") != "":
+                # Instantly remove the score tag so it doesn't mix with the text
                 sub_p = cell.find("sub", class_="p")
-                pts_text = sub_p.get_text(strip=True) if sub_p else ""
-                answers.append((ans_text, pts_text))
+                if sub_p:
+                    sub_p.decompose()
+                
+                ans_text = cell.get_text(strip=True)
+                answers.append(ans_text)
             else:
-                answers.append(("-", ""))
+                answers.append("-")
 
-        # Extract Total Points (last column 'gesamtpunkte')
+        # Extract Total Points
         total_el = tr.find("td", class_="gesamtpunkte")
         total = total_el.get_text(strip=True) if total_el else "0"
 
@@ -252,19 +253,12 @@ def build_bonus_text(labels, correct, players):
 
     # Player Rows
     for p in players:
-        display_answers = []
-        for ans, pts in p["answers"]:
-            if pts:       # If they got points, show "ANS 10"
-                display_answers.append(f"{ans[:3]}{pts}")
-            elif ans == "-": # If empty, show dash
-                display_answers.append("-")
-            else:         # If wrong answer, just show the 3-letter code
-                display_answers.append(ans[:3])
-        
+        # Clean up answers to max 4 characters so they fit nicely
+        display_answers = [ans[:4] if ans != "-" else "-" for ans in p["answers"]]
         lines.append(format_row(f"{p['pos']}. {p['name']}", display_answers, p["total"]))
 
     lines.append("```")
-    lines.append("_Points shown if correct (e.g., `GER10`) · T = Total_")
+    lines.append("_T = Total Points_")
     return "\n".join(lines)
 
 
