@@ -56,18 +56,16 @@ def split_pred(raw):
 
 def split_bonus_pred(raw):
     """
-    Bonus predictions are team abbrs sometimes with points appended:
-    'MEX10' → pred='MEX', pts='10'
-    'ARG'   → pred='ARG', pts=''
-    'USA10' → pred='USA', pts='10'
-    'GER10' → pred='GER', pts='10'
+    'MEX10' → 'MEX'  (prediction + pts stripped)
+    'ARG'   → 'ARG'  (prediction, no result yet)
+    ''      → '-'    (no prediction made)
     """
     raw = raw.strip()
     if not raw or raw == "---":
-        return "·", ""
-    m = re.match(r'^([A-Z]+)(\d+)?$', raw)
+        return "-", ""
+    m = re.match(r'^([A-Z]+)(\d*)$', raw)
     if m:
-        return m.group(1), m.group(2) or ""
+        return m.group(1), m.group(2)
     return raw, ""
 
 
@@ -256,38 +254,37 @@ def build_bonus_table(labels, results, players):
         return "⚠️ No bonus data found. Try again later."
 
     name_w = 7
-    # Column width = max of label length and max pred length
+    
+    # Calculate column widths dynamically based on label and prediction lengths
     col_widths = []
     for i, lbl in enumerate(labels):
         vals = [p["preds"][i] for p in players if i < len(p["preds"])] + [results[i]]
         col_widths.append(max(len(lbl), max((len(v) for v in vals), default=1)))
 
-    def make_row(name_col, pred_cols):
-        parts = "|".join(
+    # Unified row builder matching the leaderboard's design logic
+    def make_row(name_col, pred_cols, tot_col=""):
+        parts = " ".join(
             pred_cols[i].center(col_widths[i]) for i in range(len(pred_cols))
         )
-        return f"{name_col[:name_w].ljust(name_w)}|{parts}"
+        if tot_col:
+            return f"{name_col[:name_w].ljust(name_w)} {parts} {tot_col:>3}"
+        return f"{name_col[:name_w].ljust(name_w)} {parts}"
 
-    # Total col
-    def make_row_t(name_col, pred_cols, tot):
-        parts = "|".join(
-            pred_cols[i].center(col_widths[i]) for i in range(len(pred_cols))
-        )
-        return f"{name_col[:name_w].ljust(name_w)}|{parts}|{tot:>3}"
-
-    header  = make_row_t("",    labels,  " T ")
-    result_r= make_row_t("Res", results, "   ")
-    divider = "-" * len(header)
+    header   = make_row("",    labels,  "T")
+    result_r = make_row("Res", results, " ")
+    divider  = "-" * len(header)
 
     lines = ["🎯 *WorldPrediction2026 — Bonus*\n", "```"]
     lines.append(header)
     lines.append(result_r)
     lines.append(divider)
+    
     for p in players:
-        preds = [p["preds"][i] if i < len(p["preds"]) else "·" for i in range(len(labels))]
-        lines.append(make_row_t(p["name"], preds, p["total"]))
+        preds = [p["preds"][i] if i < len(p["preds"]) else "-" for i in range(len(labels))]
+        lines.append(make_row(p["name"], preds, p["total"]))
+        
     lines.append("```")
-    lines.append("_· = no prediction yet · T = total pts_")
+    lines.append("_- = no prediction · T = total pts_")
     return "\n".join(lines)
 
 
