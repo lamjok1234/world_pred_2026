@@ -37,8 +37,7 @@ def parse_header_cell(cell):
     m = re.match(r'^([A-Z]+)([\d]+-[\d]+|---)$', cell)
     if not m:
         return None, None
-    teams  = m.group(1)
-    result = m.group(2)
+    teams, result = m.group(1), m.group(2)
     t1, t2 = teams[:3], teams[3:]
     if not t2:
         return None, None
@@ -78,7 +77,6 @@ def fetch_matrix():
     r = requests.get(URL, headers=HEADERS, timeout=15)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-
     match_labels, match_results, players = [], [], []
 
     for table in soup.find_all("table"):
@@ -156,38 +154,81 @@ def fetch_bonus_matrix():
     r = requests.get(URL + "?bonus=true", headers=HEADERS, timeout=15)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
+    all_tables = soup.find_all("table")
 
-    bonus_labels, correct_answers, players = [], [], []
+    # ------------------------------------------------------------------
+    # Step 1 — Upper table: extract full question texts + correct answers
+    # ------------------------------------------------------------------
+    question_texts = []
+    correct_answers_upper = []
 
-    for table in soup.find_all("table"):
+    for table in all_tables:
+        for row in table.find_all("tr"):
+            cells = [c.get_text(strip=True) for c in row.find_all(["th", "td"])]
+            if len(cells) < 3:
+                continue
+            first = cells[0].replace(".", "").strip()
+            if not first.isdigit():
+                continue
+            q = cells[1].strip()
+            # Real questions are longer than the short IDs in the matrix header
+            if len(q) > 10 and not re.match(r'^[A-Z]{2,}[\d\-]+$', q):
+                question_texts.append(q)
+                ca = cells[2].strip()
+                correct_answers_upper.append(ca if ca not in ("-", "---", "") else "")
+
+    # ------------------------------------------------------------------
+    # Step 2 — Lower matrix table: per-player raw cell values
+    # ------------------------------------------------------------------
+    matrix_labels = []
+    correct_from_matrix = []
+    players = []
+
+    TOTAL_KEYWORDS = {"pkt", "punkte", "total", "sum", "t", "pts", "p"}
+
+    for table in all_tables:
         rows = table.find_all("tr")
         if not rows:
             continue
-        header_row, num_bonus = None, 0
+        header_row, num_cols = None, 0
 
         for row in rows:
             cells = [c.get_text(strip=True) for c in row.find_all(["th", "td"])]
-            if len(cells) < 4:
+            if len(cells) < 5:
                 continue
             labels = cells[3:]
             if not any(l.strip() for l in labels):
                 continue
             if any(re.match(r'^[A-Z]+(\d+-\d+|---)$', l) for l in labels):
                 continue
-            bonus_labels, num_bonus, header_row = labels, len(labels), row
+
+            # Strip trailing total-column header (e.g. "Pkt.", "T", empty)
+            clean = list(labels)
+            while clean:
+                last = clean[-1].strip().lower().rstrip(".")
+                if not clean[-1].strip() or last in TOTAL_KEYWORDS:
+                    clean.pop()
+                else:
+                    break
+            if not clean:
+                continue
+
+            matrix_labels = clean
+            num_cols = len(clean)
+            header_row = row
             break
 
         if not header_row:
             continue
 
-        remaining = [row for row in rows if row is not header_row]
+        remaining = [r for r in rows if r is not header_row]
 
-        # optional "correct answer" row right after header
+        # Correct-answer row (first non-player row after header)
         if remaining:
             fc = [c.get_text(strip=True) for c in remaining[0].find_all(["th", "td"])]
             fp = fc[0].replace(".", "").strip() if fc else ""
             if not fp.isdigit() and len(fc) >= 4:
-                correct_answers = fc[3:3 + num_bonus]
+                correct_from_matrix = fc[3:3 + num_cols]
                 remaining = remaining[1:]
 
         for row in remaining:
@@ -200,40 +241,101 @@ def fetch_bonus_matrix():
             name = cells[2].strip()
             if not name:
                 continue
-            answers, pts_list = [], []
-            for i in range(num_bonus):
-                raw = cells[3 + i] if 3 + i < len(cells) else ""
-                a, pt = split_bonus(raw)
-                answers.append(a)
-                pts_list.append(pt)
-            # last cell: total if numeric, otherwise compute from pts_list
-            last = cells[-1].strip() if cells else "0"
-            if last.isdigit():
-                total = last
-            else:
-                total = str(sum(int(pt) for pt in pts_list if pt.isdigit()))
-            players.append({
-                "pos": int(pos), "name": name,
-                "answers": answers, "pts": pts_list,
-                "total": total,
-            })
+            raw = [cells[3 + i].strip() if 3 + i < len(cells) else "" for i in range(num_cols)]
+            total_raw = cells[3 + num_cols].strip() if 3 + num_cols < len(cells) else ""
+            players.append({"pos": int(pos), "name": name, "raw": raw, "total_raw": total_raw})
+
         if players:
             break
 
-    return bonus_labels, correct_answers, players
+    # ------------------------------------------------------------------
+    # Step 3 — Map questions → matrix columns (handle multi-col last Q)
+    # ------------------------------------------------------------------
+    num_q = len(question_texts)
+    num_c = len(matrix_labels)
+
+    # Fallback: no upper table found → use matrix labels as-is
+    if num_q == 0:
+        question_texts = list(matrix_labels)
+        num_q = num_c
+
+    # Safety: can't have more questions than columns
+    if num_c < num_q:
+        question_texts = question_texts[:num_c]
+        correct_answers_upper = correct_answers_upper[:num_c]
+        num_q = num_c
+
+    # How many matrix columns does the LAST question span?
+    # e.g. 6 questions, 9 columns → last question = 4 columns (semifinal)
+    last_q_span = max(1, num_c - num_q + 1)
+
+    # ---- correct answers (prefer upper table) ----
+    correct_answers = []
+    ci = 0
+    for qi in range(num_q):
+        span = last_q_span if (qi == num_q - 1 and last_q_span > 1) else 1
+        # Prefer upper-table answer
+        if qi < len(correct_answers_upper) and correct_answers_upper[qi]:
+            correct_answers.append(correct_answers_upper[qi])
+        else:
+            # Fallback: concatenate from matrix correct-answer row
+            parts = []
+            for j in range(span):
+                if ci + j < len(correct_from_matrix):
+                    v = correct_from_matrix[ci + j]
+                    if v and v not in ("-", "---"):
+                        parts.append(v)
+            correct_answers.append(",".join(parts))
+        ci += span
+
+    # ---- per-player answers ----
+    for p in players:
+        answers, pts_list = [], []
+        ci = 0
+        for qi in range(num_q):
+            span = last_q_span if (qi == num_q - 1 and last_q_span > 1) else 1
+            if span > 1:
+                parts, pts = [], ""
+                for j in range(span):
+                    if ci + j < len(p["raw"]):
+                        a, pt = split_bonus(p["raw"][ci + j])
+                        if a not in ("-", "---"):
+                            parts.append(a)
+                        if pt and pt.isdigit():
+                            pts = pt
+                answers.append(",".join(parts) if parts else "-")
+                pts_list.append(pts)
+            else:
+                if ci < len(p["raw"]):
+                    a, pt = split_bonus(p["raw"][ci])
+                    answers.append(a)
+                    pts_list.append(pt)
+                else:
+                    answers.append("-")
+                    pts_list.append("")
+            ci += span
+
+        # Total: use matrix value if numeric, else compute from pts
+        tr = p["total_raw"]
+        if tr and tr.replace(",", ".").lstrip("-").isdigit():
+            p["total"] = tr
+        else:
+            p["total"] = str(sum(int(pt) for pt in pts_list if pt.isdigit()))
+        p["answers"] = answers
+        p["pts"] = pts_list
+        del p["raw"], p["total_raw"]
+
+    return question_texts, correct_answers, players
 
 
 def build_bonus_messages(bonus_labels, correct_answers, players):
-    """Return a list of message strings — one per question + a totals summary."""
     if not bonus_labels or not players:
         return ["⚠️ No bonus data found. Try again later."]
 
     messages = []
 
     for idx, label in enumerate(bonus_labels):
-        correct = None
-        if idx < len(correct_answers) and correct_answers[idx] not in ("-", "---", ""):
-            correct = correct_answers[idx]
+        correct = correct_answers[idx] if idx < len(correct_answers) else ""
 
         lines = [f"📌 *{label}*"]
         if correct:
@@ -242,7 +344,7 @@ def build_bonus_messages(bonus_labels, correct_answers, players):
 
         for p in players:
             answer = p["answers"][idx] if idx < len(p["answers"]) else "-"
-            pts    = p["pts"][idx]    if idx < len(p["pts"])    else ""
+            pts = p["pts"][idx] if idx < len(p["pts"]) else ""
 
             if correct and answer not in ("-", "---"):
                 if pts and int(pts) > 0:
@@ -258,7 +360,7 @@ def build_bonus_messages(bonus_labels, correct_answers, players):
 
         messages.append("\n".join(lines))
 
-    # totals summary
+    # Totals summary
     sum_lines = ["📊 *Bonus Totals*", ""]
     for p in players:
         sum_lines.append(f"{p['pos']}. {p['name']} — {p['total']}pts")
